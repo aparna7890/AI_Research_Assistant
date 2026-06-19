@@ -7,7 +7,13 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
-_REFERENCES_RE = re.compile(r"^(references|bibliography|works cited)\s*$", re.IGNORECASE)
+# Matches a references/bibliography heading, optionally prefixed with a
+# section number ("7 References", "References", "8. Bibliography") and
+# optionally followed by trailing punctuation.
+_REFERENCES_RE = re.compile(
+    r"^(\d{1,2}(\.\d{1,2})*\.?\s+)?(references|bibliography|works cited)\.?\s*$",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -115,11 +121,95 @@ def _make_section(title: str, index: int, text: str) -> Section:
     )
 
 
+# Matches numbered headings like "3.1 Scaled Dot-Product Attention".
+# Capped at 2 numbering levels deep ("1", "1.2", "1.2.3" — not "1.2.3.4.5").
+# This regex alone is still loose — the heavy filtering (word count, comma
+# check, title-case ratio) happens in _looks_like_heading below. Requiring a
+# Title Case word right after the number already excludes most body
+# sentences and reference-list entries, which usually start lowercase or
+# with a surname followed by a comma (e.g. "12 Vaswani, A., Shazeer, N. ...").
+_NUMBERED_HEADING_RE = re.compile(r"^\d{1,2}(\.\d{1,2}){0,2}\s+[A-Z][a-z]")
+
+# Short "glue" words that are allowed to stay lowercase inside an otherwise
+# Title Case heading, e.g. "Attention Is All You Need", "What Does BERT Learn".
+_GLUE_WORDS = {
+    "a", "an", "the", "is", "are", "of", "in", "on", "to", "and", "or",
+    "for", "with", "via", "vs", "all", "you", "we", "do", "does",
+}
+
+
+def _looks_like_title_case(words: list[str]) -> bool:
+    """
+    Decide whether a sequence of words reads like a heading ("Title Case")
+    rather than a sentence ("Sentence case").
+
+    Headings: most words start with a capital letter, except small glue words.
+    Sentences: only the first word is capitalised; the rest are lowercase.
+
+    We require at least 70% of words to be "capitalised or glue" so that
+    "Scaled Dot-Product Attention" passes but "We propose a new architecture"
+    (only "We" is capitalised) fails.
+    """
+    if not words:
+        return False
+    capitalised = 0
+    for w in words:
+        clean = w.strip(",.;:()")
+        if not clean:
+            continue
+        if clean[0].isupper() or clean.lower() in _GLUE_WORDS:
+            capitalised += 1
+    return (capitalised / len(words)) >= 0.7
+
+
 def _looks_like_heading(text: str) -> bool:
-    if re.match(r"^\d+(\.\d+)*\s+[A-Z]", text):
+    """
+    Heuristically decide whether a line of text is a section heading,
+    as a FALLBACK for when font-size detection (the primary signal in
+    parse_pdf) doesn't clearly mark it as one.
+
+    This function used to match ANY line starting with "<number> <Capital>",
+    which is also the shape of:
+      - reference list entries:  "12 Vaswani, A., Shazeer, N. ..."
+      - ordinary sentences that happen to start with a digit:
+        "2017 The Transformer follows this overall architecture"
+        "2 We propose a new architecture for sequence transduction"
+    That caused hundreds of false "section breaks" per paper (one per
+    numbered reference + one per digit-led sentence), which in turn made
+    the chunker treat each false section as its own tiny chunk — exploding
+    a ~15-page paper into 700+ chunks instead of the expected ~20-40.
+
+    Fixed by requiring ALL of:
+      1. Short line (<= 6 words) — real headings are short, sentences and
+         reference entries are long.
+      2. No comma in the first 25 characters — reference entries
+         ("Surname, Initial., ...") have one; headings don't.
+      3. Title Case — most words capitalised, not just the first
+         ("Scaled Dot-Product Attention" vs "We propose a new...").
+    """
+    text = text.strip()
+    words = text.split()
+
+    # Real section titles are short, e.g. "3.1 Scaled Dot-Product Attention"
+    # is 4 words. Sentences and reference entries run much longer.
+    if len(words) > 6:
+        return False
+
+    # ALL-CAPS short lines: "ABSTRACT", "REFERENCES", "CONCLUSION"
+    if text.isupper() and 2 <= len(text) < 60:
         return True
-    if text.isupper() and len(text) < 60:
-        return True
+
+    # Numbered section headings: "1 Introduction", "4.2 Why Self-Attention"
+    if _NUMBERED_HEADING_RE.match(text):
+        # Reference entries look like "12 Vaswani, A., Shazeer, N. ..." —
+        # a comma shows up almost immediately after the author's surname.
+        if "," in text[:25]:
+            return False
+        # Strip the leading "1.2 " and check the remainder is Title Case,
+        # not a sentence like "1 We use 8 attention heads".
+        rest = re.sub(r"^\d{1,2}(\.\d{1,2}){0,2}\s+", "", text)
+        return _looks_like_title_case(rest.split())
+
     return False
 
 
